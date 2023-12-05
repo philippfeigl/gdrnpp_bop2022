@@ -36,7 +36,6 @@ class GDRN_ROS:
             rospy.init_node("gdrn_estimation")
             s = rospy.Service("estimate_poses", estimate_poses, self.estimate_pose)
             print("Pose Estimation with GDRNet is ready.")
-
             rospy.spin()
 
     def estimate_pose(self, req):
@@ -127,5 +126,3 @@ class GDRN_ROS:
     
 if __name__ == "__main__":
     GDRN_ROS()
-    
-

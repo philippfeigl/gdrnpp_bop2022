@@ -10,6 +10,10 @@ import numpy as np
 import cv2
 import json
 
+import rospy
+from sensor_msgs.msg import Image
+from cv_bridge import CvBridge
+
 from core.gdrn_modeling.main_gdrn import Lite
 from core.gdrn_modeling.engine.engine_utils import get_out_mask, get_out_coor, batch_data_inference_roi
 from core.gdrn_modeling.engine.gdrn_evaluator import get_pnp_ransac_pose
@@ -55,7 +59,7 @@ class GdrnPredictor():
                                           'MODEL.WEIGHTS': ckpt_file_path},
                                     TEST ={
                                         'TEST.EVAL_PERIOD': 0,
-                                        'TEST.VIS': True,
+                                        'TEST.VIS': False,
                                         'TEST.USE_PNP': True,
                                         'TEST.USE_DEPTH_REFINE': False,
                                         'TEST.USE_COOR_Z_REFINE': False,
@@ -102,16 +106,6 @@ class GdrnPredictor():
         self.obj_ids = [i for i in self.objs.keys()]
         self.extents = self._get_extents()
 
-        # with open(camera_json_path) as f:
-        #     camera_json = json.load(f)
-        #     # self.cam = np.asarray([
-        #     #     [camera_json['fx'], 0., camera_json['cx']],
-        #     #     [0., camera_json['fy'], camera_json['cy']],
-        #     #     [0., 0., 1.]])
-        #     self.cam = np.asarray([
-        #         [606.6173706054688, 0., 322.375],
-        #         [0., 605.2778930664062, 232.67811584472656],
-        #         [0., 0., 1.]])
         self.cam = camera_intrinsics
         self.depth_scale = 0.1
 
@@ -124,16 +118,28 @@ class GdrnPredictor():
 
         self.model = self.set_eval_model(model_lite, self.args, self.cfg)
 
-        if self.cfg.TEST.USE_DEPTH_REFINE:
-            self.ren = Renderer(size=(64, 64), cam=self.cam)
-            self.ren_models = load_models(
-                model_paths=[os.path.join(self.objs_dir, f"obj_{i:06d}.ply") for i in self.objs.keys()],
-                scale_to_meter=self.args.vertex_scale,
-                cache_dir=".cache",
-                texture_paths=None,
-                center=False,
-                use_cache=False,
-            )
+        # if self.cfg.TEST.USE_DEPTH_REFINE:
+        #     self.ren = Renderer(size=(64, 64), cam=self.cam)
+        #     print([os.path.join(self.objs_dir, f"obj_{i:06d}.ply") for i in self.objs.keys()])
+        #     self.ren_models = load_models(
+        #         model_paths=[os.path.join(self.objs_dir, f"obj_{i:06d}.ply") for i in self.objs.keys()],
+        #         scale_to_meter=0.001,
+        #         cache_dir=".cache",
+        #         #texture_paths=None,
+        #         texture_paths=self.data_ref.texture_paths if self.cfg.DEBUG else None,
+        #         center=False,
+        #         use_cache=True,
+        #     )
+
+        self.ren_models = load_models(
+            model_paths=[os.path.join(self.objs_dir, f"obj_{i:06d}.ply") for i in self.objs.keys()],
+            scale_to_meter=0.001,
+            cache_dir=".cache",
+            #texture_paths=None,
+            texture_paths=self.data_ref.texture_paths if self.cfg.DEBUG else None,
+            center=False,
+            use_cache=True,
+        )
 
     def set_eval_model(self, model_lite, args, cfg):
         model_lite.set_my_env(args, cfg)
@@ -205,8 +211,9 @@ class GdrnPredictor():
                     }
                 )
             data_dict["cur_res"].append(cur_res)
-        #if self.cfg.TEST.USE_DEPTH_REFINE:
-        #    self.process_depth_refine(data_dict, out_dict)
+
+        if self.cfg.TEST.USE_DEPTH_REFINE:
+           self.process_depth_refine(data_dict, out_dict)
 
         poses = {}
         for res in data_dict["cur_res"]:
@@ -217,8 +224,6 @@ class GdrnPredictor():
 
         return poses
 
-
-
     def process_depth_refine(self, inputs, out_dict):
         """
         Postprocess the gdrn result and refine with the depth information.
@@ -227,6 +232,7 @@ class GdrnPredictor():
             out_dict: gdrn model output
         """
         cfg = self.cfg
+        net_cfg = cfg.MODEL.POSE_NET
         out_coor_x = out_dict["coor_x"].detach()
         out_coor_y = out_dict["coor_y"].detach()
         out_coor_z = out_dict["coor_z"].detach()
@@ -241,6 +247,12 @@ class GdrnPredictor():
         zoom_K = batch_data_inference_roi(cfg, [inputs])['roi_zoom_K']
 
         out_i = -1
+        self.ren = Renderer(size=(64, 64), cam=self.cam)
+      
+        pub_sensor = rospy.Publisher('/depth_sensor_mask', Image, queue_size=10)
+        pub_render = rospy.Publisher('/depth_render_mask', Image, queue_size=10)
+        bridge = CvBridge()
+        
         for i, _input in enumerate([inputs]):
 
             for inst_i in range(len(_input["roi_img"])):
@@ -261,9 +273,13 @@ class GdrnPredictor():
                 rot_est = out_rots[out_i]
                 trans_est = out_transes[out_i]
                 pose_est = np.hstack([rot_est, trans_est.reshape(3, 1)])
-                # depth_sensor_crop = _input['roi_depth'][inst_i].cpu().numpy().copy().squeeze()
+                #depth_sensor_crop = _input['roi_depth'][inst_i].cpu().numpy().copy().squeeze()
                 depth_sensor_crop = cv2.resize(_input['roi_depth'][inst_i].cpu().numpy().copy().squeeze(), (64, 64))
                 depth_sensor_mask_crop = depth_sensor_crop > 0
+
+                depth_sensor_mask_crop_image = (depth_sensor_mask_crop * 255).astype(np.uint8)
+                depth_sensor_crop_ros = bridge.cv2_to_imgmsg(depth_sensor_mask_crop_image, encoding='passthrough')
+                pub_sensor.publish(depth_sensor_crop_ros)
 
                 net_cfg = cfg.MODEL.POSE_NET
                 crop_res = net_cfg.OUTPUT_RES
@@ -273,7 +289,12 @@ class GdrnPredictor():
                     self.ren.set_cam(K_crop)
                     self.ren.draw_model(self.ren_models[self.cls_names.index(cls_name)], pose_est)
                     ren_im, ren_dp = self.ren.finish()
+                    print(ren_im)
                     ren_mask = ren_dp > 0
+    
+                    depth_render_mask_crop_image = (ren_mask * 255).astype(np.uint8)
+                    depth_render_crop_ros = bridge.cv2_to_imgmsg(ren_dp, encoding='passthrough')
+                    pub_render.publish(depth_render_crop_ros)
 
                     if self.cfg.TEST.USE_COOR_Z_REFINE:
                         coor_np = xyz_i.numpy()
@@ -297,8 +318,6 @@ class GdrnPredictor():
                     yy, xx = np.argwhere(norm_mask).T  # 2 x (N,)
                     depth_diff = depth_sensor_crop[yy, xx] - ren_dp[yy, xx]
                     depth_adjustment = np.median(depth_diff)
-
-
 
                     yx_coords = np.meshgrid(np.arange(crop_res), np.arange(crop_res))
                     yx_coords = np.stack(yx_coords[::-1], axis=-1)  # (crop_res, crop_res, 2yx)
@@ -325,7 +344,7 @@ class GdrnPredictor():
         cls_name = self.cls_names[label]
         return label, cls_name
 
-    def preprocessing(self, outputs, image, depth_img = None):
+    def preprocessing(self, outputs, image, depth_img):
         """
         Preprocessing detection model output and input image
         Args:
@@ -615,52 +634,52 @@ class GdrnPredictor():
         # cfg.freeze()
         return cfg
 
-    def gdrn_visualization(self, batch, out_dict, image):
-        vis_dict = {}
+    # def gdrn_visualization(self, batch, out_dict, image):
+    #     vis_dict = {}
 
-        # for crop and resize
-        bs = batch["roi_cls"].shape[0]
-        print(bs)
-        tensor_kwargs = {"dtype": torch.float32, "device": "cuda"}
-        rois_xy0 = batch["roi_center"] - batch["scale"].view(bs, -1) / 2  # bx2
-        rois_xy1 = batch["roi_center"] + batch["scale"].view(bs, -1) / 2  # bx2
-        batch["inst_rois"] = torch.cat([torch.arange(bs, **tensor_kwargs).view(-1, 1), rois_xy0, rois_xy1], dim=1)
+    #     # for crop and resize
+    #     bs = batch["roi_cls"].shape[0]
+    #     #print(bs)
+    #     tensor_kwargs = {"dtype": torch.float32, "device": "cuda"}
+    #     rois_xy0 = batch["roi_center"] - batch["scale"].view(bs, -1) / 2  # bx2
+    #     rois_xy1 = batch["roi_center"] + batch["scale"].view(bs, -1) / 2  # bx2
+    #     batch["inst_rois"] = torch.cat([torch.arange(bs, **tensor_kwargs).view(-1, 1), rois_xy0, rois_xy1], dim=1)
 
-        im_H = int(batch["im_H"][0])
-        im_W = int(batch["im_W"][0])
-        if "full_mask" in out_dict:
-            raw_full_masks = out_dict["full_mask"]
-            full_mask_probs = get_out_mask(self.cfg, raw_full_masks)
-            full_masks_in_im = paste_masks_in_image(
-                full_mask_probs[:, 0, :, :],
-                batch["inst_rois"][:, 1:5],
-                image_shape=(im_H, im_W),
-                threshold=0.5,
-            )
-            full_masks_np = full_masks_in_im.detach().to(torch.uint8).cpu().numpy()
+    #     im_H = int(batch["im_H"][0])
+    #     im_W = int(batch["im_W"][0])
+    #     if "full_mask" in out_dict:
+    #         raw_full_masks = out_dict["full_mask"]
+    #         full_mask_probs = get_out_mask(self.cfg, raw_full_masks)
+    #         full_masks_in_im = paste_masks_in_image(
+    #             full_mask_probs[:, 0, :, :],
+    #             batch["inst_rois"][:, 1:5],
+    #             image_shape=(im_H, im_W),
+    #             threshold=0.5,
+    #         )
+    #         full_masks_np = full_masks_in_im.detach().to(torch.uint8).cpu().numpy()
 
-            img_vis_full_mask = vis_image_mask_bbox_cv2(
-                image,
-                [full_masks_np[i] for i in range(bs)],
-                [batch["bbox_est"][i].detach().cpu().numpy() for i in range(bs)],
-                labels=self.cls_names,
-            )
+    #         img_vis_full_mask = vis_image_mask_bbox_cv2(
+    #             image,
+    #             [full_masks_np[i] for i in range(bs)],
+    #             [batch["bbox_est"][i].detach().cpu().numpy() for i in range(bs)],
+    #             labels=self.cls_names,
+    #         )
 
-            vis_dict[f"im_det_and_mask_full"] = img_vis_full_mask[:, :, ::-1]
+    #         vis_dict[f"im_det_and_mask_full"] = img_vis_full_mask[:, :, ::-1]
 
-        for i in range(bs):
-            R = batch["cur_res"][i]["R"]
-            t = batch["cur_res"][i]["t"]
-            # pose_est = np.hstack([R, t.reshape(3, 1)])
-            proj_pts_est = misc.project_pts(self.obj_models[i+1]["pts"], self.cam, R, t)
-            mask_pose_est = misc.points2d_to_mask(proj_pts_est, im_H, im_W)
-            image_mask_pose_est = vis_image_mask_cv2(image, mask_pose_est, color="yellow" if i == 0 else "blue")
-            image_mask_pose_est = vis_image_bboxes_cv2(
-                image_mask_pose_est,
-                [batch["bbox_est"][i].detach().cpu().numpy()],
-                labels=[self.cls_names[i]]
-            )
-            vis_dict[f"im_{i}_mask_pose_est"] = image_mask_pose_est[:, :, ::-1]
-        show_ims = np.hstack([cv2.cvtColor(_v, cv2.COLOR_BGR2RGB) for _k, _v in vis_dict.items()])
-        cv2.imshow('result', show_ims)
-        cv2.waitKey(1)
+    #     for i in range(bs):
+    #         R = batch["cur_res"][i]["R"]
+    #         t = batch["cur_res"][i]["t"]
+    #         # pose_est = np.hstack([R, t.reshape(3, 1)])
+    #         proj_pts_est = misc.project_pts(self.obj_models[i+1]["pts"], self.cam, R, t)
+    #         mask_pose_est = misc.points2d_to_mask(proj_pts_est, im_H, im_W)
+    #         image_mask_pose_est = vis_image_mask_cv2(image, mask_pose_est, color="yellow" if i == 0 else "blue")
+    #         image_mask_pose_est = vis_image_bboxes_cv2(
+    #             image_mask_pose_est,
+    #             [batch["bbox_est"][i].detach().cpu().numpy()],
+    #             labels=[self.cls_names[i]]
+    #         )
+    #         vis_dict[f"im_{i}_mask_pose_est"] = image_mask_pose_est[:, :, ::-1]
+    #     show_ims = np.hstack([cv2.cvtColor(_v, cv2.COLOR_BGR2RGB) for _k, _v in vis_dict.items()])
+    #     cv2.imshow('result', show_ims)
+    #     cv2.waitKey(1)
